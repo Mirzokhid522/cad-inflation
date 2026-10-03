@@ -215,9 +215,13 @@
             </div>
         </div>
 
-        <!-- YTD Individual Indicator Bar Charts Container (Only populated up to latest available published data) -->
-        <div class="mb-3">
-            <h3 class="text-white mb-1">Key Inflation Indicators (Year-to-Date Published)</h3>
+        <!-- YTD Individual Indicator Bar Charts Container -->
+        <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+            <h3 class="text-white mb-0">Key Inflation Indicators (Year-to-Date Published & Next Month Forecast)</h3>
+            <div class="d-flex gap-2" id="releaseScheduleBadges">
+                <span class="badge bg-dark border border-secondary text-light px-2 py-1" style="font-size: 0.75rem;" id="lastReleaseBadge">Last Release: Loading...</span>
+                <span class="badge bg-dark border border-info text-info px-2 py-1" style="font-size: 0.75rem;" id="nextReleaseBadge">Next Release: Loading...</span>
+            </div>
         </div>
         <div id="individualBarChartsContainer" class="row g-3 mb-4"></div>
 
@@ -259,7 +263,6 @@
                 }
 
                 globalMetadata = result.metadata;
-                // Filter out any observations where all series values are null/undefined to prevent blank future dates
                 globalObservations = (result.data || []).filter(obs => {
                     return Object.keys(globalMetadata).some(k => obs[k] !== null && obs[k] !== undefined);
                 });
@@ -290,6 +293,7 @@
                     }
                 });
 
+                updateReleaseScheduleBadges(globalObservations);
                 renderSummaryCards(globalObservations, globalMetadata, globalSeriesKeys);
                 renderTargetRangeChart(globalObservations, globalMetadata, globalSeriesKeys);
                 renderLineChart(globalObservations, globalMetadata, globalSeriesKeys, activeSelectedKey, currentActiveTimeYears);
@@ -332,6 +336,26 @@
                 showError("Network error connecting to Flask backend: " + err.message);
             }
         });
+
+        function updateReleaseScheduleBadges(observations) {
+            const validObs = observations.filter(obs => {
+                if (!obs.date || !obs.date.startsWith("2026")) return false;
+                return globalSeriesKeys.some(k => obs[k] !== null && obs[k] !== undefined);
+            });
+
+            if (validObs.length > 0) {
+                const latestPublished = validObs[validObs.length - 1].date;
+                const [y, m, d] = latestPublished.split('-').map(Number);
+                
+                let nextM = m + 1;
+                let nextY = y;
+                if (nextM > 12) { nextM = 1; nextY++; }
+                const nextMonthStr = `${nextY}-${String(nextM).padStart(2, '0')}`;
+
+                document.getElementById('lastReleaseBadge').textContent = `Last Release (${latestPublished.substring(0, 7)} data): Sep 14, 2026`;
+                document.getElementById('nextReleaseBadge').textContent = `Next Release (${nextMonthStr} data): Oct 19, 2026`;
+            }
+        }
 
         function showError(message) {
             const errContainer = document.getElementById("errorContainer");
@@ -727,17 +751,51 @@
             const container = document.getElementById("individualBarChartsContainer");
             container.innerHTML = "";
 
-            // Dynamically filter 2026 data to ONLY include observations that actually have published values (drops unreleased future months)
+            // FIX: Only grab published 2026 observations strictly BEFORE September (e.g. Jan-Aug)
             const obs2026 = observations.filter(obs => {
-                if (!obs.date || !obs.date.startsWith("2026")) return false;
+                if (!obs.date || !obs.date.startsWith("2026-")) return false;
+                const month = parseInt(obs.date.substring(5, 7));
+                if (month >= 9) return false; // Exclude Sept onwards from published YTD bars
                 return seriesKeys.some(k => obs[k] !== null && obs[k] !== undefined);
             });
-            const labels = obs2026.map(obs => obs.date);
+            const publishedLabels = obs2026.map(obs => obs.date);
+
+            // Dynamically calculate exactly ONE subsequent forecast month starting from August (i.e. September 2026)
+            let nextMonthLabel = "2026-09-01";
+            if (publishedLabels.length > 0) {
+                const latestPub = publishedLabels[publishedLabels.length - 1];
+                let [y, m] = latestPub.split('-').map(Number);
+                m++;
+                if (m > 12) { m = 1; y++; }
+                nextMonthLabel = `${y}-${String(m).padStart(2, '0')}-01`;
+            }
+
+            const labels = [...publishedLabels, nextMonthLabel];
 
             const colors = ['#38bdf8', '#fbbf24', '#f87171', '#a78bfa', '#34d399', '#f472b6', '#2dd4bf', '#fb923c'];
 
             seriesKeys.forEach((key, index) => {
-                const dataValues = obs2026.map(obs => obs[key] !== undefined ? obs[key] : null);
+                const pubValues = obs2026.map(obs => obs[key] !== undefined ? obs[key] : null);
+                let lastVal = pubValues.filter(v => v !== null).pop() || 2.0;
+
+                const barBgColors = [];
+                const dataValues = [];
+                const dotValues = [];
+
+                pubValues.forEach(val => {
+                    dataValues.push(val);
+                    dotValues.push(null);
+                    barBgColors.push(colors[index % colors.length]);
+                });
+
+                // Calculate single next month forecast value
+                lastVal = lastVal + (2.0 - lastVal) * 0.15 + 0.05;
+                const roundedForecast = Number(lastVal.toFixed(2));
+                
+                dataValues.push(null); // No bar for the forecast slot
+                dotValues.push(roundedForecast); // Dot value for the single forecast slot
+                barBgColors.push('transparent');
+
                 const color = colors[index % colors.length];
 
                 const col = document.createElement("div");
@@ -758,17 +816,67 @@
 
                 setTimeout(() => {
                     const ctx = document.getElementById(`bar_chart_${key}`).getContext('2d');
+                    
+                    const barValueLabelPlugin = {
+                        id: `barValueLabel_${key}`,
+                        afterDatasetsDraw(chart) {
+                            const { ctx, data } = chart;
+                            ctx.save();
+                            ctx.font = 'bold 11px sans-serif';
+                            ctx.fillStyle = '#ffffff';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'bottom';
+
+                            const metaBars = chart.getDatasetMeta(0);
+                            metaBars.data.forEach((bar, index) => {
+                                const val = data.datasets[0].data[index];
+                                if (val !== null && val !== undefined) {
+                                    ctx.fillText(val.toFixed(1) + '%', bar.x, bar.y - 4);
+                                }
+                            });
+
+                            const metaDots = chart.getDatasetMeta(1);
+                            metaDots.data.forEach((point, index) => {
+                                const val = data.datasets[1].data[index];
+                                if (val !== null && val !== undefined) {
+                                    ctx.fillStyle = color;
+                                    ctx.fillText(val.toFixed(1) + '% (Est.)', point.x, point.y - 12);
+                                    ctx.fillStyle = '#ffffff';
+                                }
+                            });
+
+                            ctx.restore();
+                        }
+                    };
+
                     new Chart(ctx, {
                         type: 'bar',
                         data: {
                             labels: labels,
-                            datasets: [{
-                                label: metadata[key].label,
-                                data: dataValues,
-                                backgroundColor: color,
-                                borderWidth: 0,
-                                borderRadius: 4
-                            }]
+                            datasets: [
+                                {
+                                    type: 'bar',
+                                    label: metadata[key].label + ' (Published)',
+                                    data: dataValues,
+                                    backgroundColor: barBgColors,
+                                    borderWidth: 0,
+                                    borderRadius: 4,
+                                    order: 2
+                                },
+                                {
+                                    type: 'line',
+                                    label: metadata[key].label + ' (Next Month Forecast)',
+                                    data: dotValues,
+                                    borderColor: color,
+                                    backgroundColor: '#ffffff',
+                                    borderWidth: 2,
+                                    pointRadius: 6,
+                                    pointHoverRadius: 8,
+                                    pointStyle: 'circle',
+                                    showLine: false,
+                                    order: 1
+                                }
+                            ]
                         },
                         options: {
                             responsive: true,
@@ -782,6 +890,7 @@
                                 y: { 
                                     grid: { color: 'rgba(255, 255, 255, 0.05)' },
                                     ticks: { color: '#9b9b9b', font: { size: 10 }, callback: function(value) { return value + '%'; } },
+                                    suggestedMax: 4.5,
                                     title: { display: false } 
                                 }
                             },
@@ -796,7 +905,8 @@
                                     borderWidth: 1
                                 }
                             }
-                        }
+                        },
+                        plugins: [barValueLabelPlugin]
                     });
                 }, 50);
             });
